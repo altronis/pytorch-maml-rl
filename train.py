@@ -3,10 +3,11 @@ import torch
 import json
 import os
 import yaml
+import numpy as np
 from tqdm import trange
 
 import maml_rl.envs
-from maml_rl.metalearners import MAMLTRPO
+from maml_rl.metalearners import MAMLTRPO, MAMLPPO
 from maml_rl.baseline import LinearFeatureBaseline
 from maml_rl.samplers import MultiTaskSampler
 from maml_rl.utils.helpers import get_policy_for_env, get_input_size
@@ -22,6 +23,7 @@ def main(args):
             os.makedirs(args.output_folder)
         policy_filename = os.path.join(args.output_folder, 'policy.th')
         config_filename = os.path.join(args.output_folder, 'config.json')
+        log_filename = os.path.join(args.output_folder, 'avg_returns.npy')
 
         with open(config_filename, 'w') as f:
             config.update(vars(args))
@@ -53,10 +55,13 @@ def main(args):
                                seed=args.seed,
                                num_workers=args.num_workers)
 
-    metalearner = MAMLTRPO(policy,
+    model_type = MAMLPPO if args.use_ppo else MAMLTRPO
+    metalearner = model_type(policy,
                            fast_lr=config['fast-lr'],
                            first_order=config['first-order'],
                            device=args.device)
+
+    avg_returns = []
 
     num_iterations = 0
     for batch in trange(config['num-batches']):
@@ -67,25 +72,26 @@ def main(args):
                                        gamma=config['gamma'],
                                        gae_lambda=config['gae-lambda'],
                                        device=args.device)
-        logs = metalearner.step(*futures,
-                                max_kl=config['max-kl'],
-                                cg_iters=config['cg-iters'],
-                                cg_damping=config['cg-damping'],
-                                ls_max_steps=config['ls-max-steps'],
-                                ls_backtrack_ratio=config['ls-backtrack-ratio'])
+        metalearner.step(*futures,
+                         max_kl=config['max-kl'],
+                         cg_iters=config['cg-iters'],
+                         cg_damping=config['cg-damping'],
+                         ls_max_steps=config['ls-max-steps'],
+                         ls_backtrack_ratio=config['ls-backtrack-ratio'])
 
         train_episodes, valid_episodes = sampler.sample_wait(futures)
         num_iterations += sum(sum(episode.lengths) for episode in train_episodes[0])
         num_iterations += sum(sum(episode.lengths) for episode in valid_episodes)
-        logs.update(tasks=tasks,
-                    num_iterations=num_iterations,
-                    train_returns=get_returns(train_episodes[0]),
-                    valid_returns=get_returns(valid_episodes))
 
         # Save policy
         if args.output_folder is not None:
             with open(policy_filename, 'wb') as f:
                 torch.save(policy.state_dict(), f)
+
+        avg_return = get_returns(valid_episodes).mean()
+        avg_returns.append(avg_return)
+
+    np.save(log_filename, np.array(avg_returns))
 
 
 if __name__ == '__main__':
@@ -93,26 +99,28 @@ if __name__ == '__main__':
     import multiprocessing as mp
 
     parser = argparse.ArgumentParser(description='Reinforcement learning with '
-        'Model-Agnostic Meta-Learning (MAML) - Train')
+                                                 'Model-Agnostic Meta-Learning (MAML) - Train')
 
     parser.add_argument('--config', type=str, required=True,
         help='path to the configuration file.')
+    parser.add_argument('--use_ppo', action='store_true',
+                        help='use PPO instead of TRPO')
 
     # Miscellaneous
     misc = parser.add_argument_group('Miscellaneous')
     misc.add_argument('--output-folder', type=str,
-        help='name of the output folder')
+                      help='name of the output folder')
     misc.add_argument('--seed', type=int, default=None,
-        help='random seed')
+                      help='random seed')
     misc.add_argument('--num-workers', type=int, default=mp.cpu_count() - 1,
-        help='number of workers for trajectories sampling (default: '
-             '{0})'.format(mp.cpu_count() - 1))
+                      help='number of workers for trajectories sampling (default: '
+                           '{0})'.format(mp.cpu_count() - 1))
     misc.add_argument('--use-cuda', action='store_true',
-        help='use cuda (default: false, use cpu). WARNING: Full upport for cuda '
-        'is not guaranteed. Using CPU is encouraged.')
+                      help='use cuda (default: false, use cpu). WARNING: Full upport for cuda '
+                           'is not guaranteed. Using CPU is encouraged.')
 
     args = parser.parse_args()
     args.device = ('cuda' if (torch.cuda.is_available()
-                   and args.use_cuda) else 'cpu')
+                              and args.use_cuda) else 'cpu')
 
     main(args)
